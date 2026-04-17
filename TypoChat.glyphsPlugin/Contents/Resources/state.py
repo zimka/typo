@@ -5,18 +5,28 @@ import json
 import urllib.error
 
 from utils import (
+    DEFAULT_CACHE_CONTROL,
     DEFAULT_MAX_TOKENS,
     DEFAULT_MODEL,
     DEFAULT_SYSTEM_PROMPT,
     _messages_endpoint,
     assistant_reply_or_error,
     build_messages_request_body,
+    format_usage_caption,
+    normalize_usage,
     parse_max_tokens,
     post_messages_request,
 )
 
 _SETTINGS_KEYS = frozenset(
     {"baseUrl", "apiKey", "model", "maxTokens", "systemPrompt"}
+)
+
+_USAGE_SUM_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
 )
 
 
@@ -30,6 +40,8 @@ class ChatState:
 
     def __init__(self):
         self._messages = []
+        self._last_usage = None
+        self._usage_session = {k: 0 for k in _USAGE_SUM_KEYS}
         self.settings = {
             "baseUrl": "",
             "apiKey": "",
@@ -82,8 +94,8 @@ class ChatState:
 
         ``messages`` must already include the latest user message. Call
         :meth:`validate_setting_errors` before invoking. Returns
-        ``(reply_text, None)`` on success (``reply_text`` may be empty string), or
-        ``(None, err_text)`` on failure (HTTP, transport, or API-level error payload).
+        ``(reply_text, None, usage_norm)`` on success (``reply_text`` may be empty string), or
+        ``(None, err_text, None)`` on failure (HTTP, transport, or API-level error payload).
         """
         s = self.settings
         model = (s.get("model") or "").strip() or DEFAULT_MODEL
@@ -95,9 +107,14 @@ class ChatState:
 
         err_out = None
         reply_text = None
+        usage_norm = None
         try:
             body = build_messages_request_body(
-                model, max_tokens, self._messages, system_text
+                model,
+                max_tokens,
+                self._messages,
+                system_text,
+                cache_control=DEFAULT_CACHE_CONTROL,
             )
             payload = post_messages_request(body, url, auth)
             got_reply, got_err = assistant_reply_or_error(payload)
@@ -106,6 +123,11 @@ class ChatState:
             else:
                 reply_text = got_reply
                 self.append_assistant(reply_text)
+                raw_usage = payload.get("usage") if isinstance(payload, dict) else None
+                usage_norm = normalize_usage(raw_usage)
+                self._last_usage = usage_norm
+                for k in _USAGE_SUM_KEYS:
+                    self._usage_session[k] += usage_norm[k]
         except urllib.error.HTTPError as e:
             try:
                 err_body = e.read().decode("utf-8", errors="replace")
@@ -114,10 +136,16 @@ class ChatState:
             err_out = "[HTTP %s] %s" % (e.code, err_body[:4000])
         except Exception as e:
             err_out = str(e)
-        return reply_text, err_out
+        return reply_text, err_out, usage_norm
+
+    def usage_caption(self):
+        """English one-line string for token usage UI (last turn + session totals)."""
+        return format_usage_caption(self._last_usage, self._usage_session)
 
     def clear(self):
         self._messages = []
+        self._last_usage = None
+        self._usage_session = {k: 0 for k in _USAGE_SUM_KEYS}
 
     def get_settings_json(self):
         """Serialize ``settings`` to a JSON string for Glyphs.defaults."""

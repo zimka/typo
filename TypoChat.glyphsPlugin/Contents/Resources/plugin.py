@@ -50,8 +50,17 @@ def _show_alert(title, text):
 def _load_persistent_settings(state):
     """Load settings from JSON blob, or migrate from legacy flat keys if blob is absent."""
     blob = _get_default("settingsJson", "")
-    assert blob and str(blob).strip()
-    state.set_settings_json(str(blob))
+    if blob and str(blob).strip():
+        state.set_settings_json(str(blob))
+    else:
+        dm, dmt, dsp = migration_default_strings()
+        state.migrate_from_legacy_flat(
+            baseUrl=_get_default("baseUrl", ""),
+            apiKey=_get_default("apiKey", ""),
+            model=_get_default("model", dm),
+            maxTokens=_get_default("maxTokens", dmt),
+            systemPrompt=_get_default("systemPrompt", dsp),
+        )
 
 
 class TypoChatPlugin(GeneralPlugin):
@@ -75,7 +84,7 @@ class TypoChatPlugin(GeneralPlugin):
         """Create or replace ``self.w``. Vanilla forbids ``open()`` after close; rebuild when ``_window`` is None."""
         self._frame_autosave_set = False
         s = self._state.settings
-        self.w = Window((600, 760), self.name, minSize=(560, 680))
+        self.w = Window((600, 792), self.name, minSize=(560, 712))
 
         y = 12
         self.w.baseUrlLabel = TextBox((12, y, 300, 14), "Base URL (POST → …/v1/messages)")
@@ -143,7 +152,9 @@ class TypoChatPlugin(GeneralPlugin):
             placeholder="Type a message…",
             continuous=False,
         )
-        y += 30
+        y += 26
+        self.w.tokenUsageLabel = TextBox((12, y, -12, 28), self._state.usage_caption())
+        y += 32
 
         self.w.sendButton = Button(
             (12, y, 120, 22),
@@ -232,10 +243,12 @@ class TypoChatPlugin(GeneralPlugin):
         self.w.sendButton.enable(False)
 
         def worker():
-            reply_text, err_out = self._state.send_messages_request_and_append_assistant()
+            reply_text, err_out, _usage = self._state.send_messages_request_and_append_assistant()
 
             def finish():
                 self.w.sendButton.enable(True)
+                # On API errors, last successful usage stays in _state (not overwritten).
+                self.w.tokenUsageLabel.set(self._state.usage_caption())
                 if err_out:
                     self._append_transcript("%s\n\n" % err_out)
                 elif reply_text is not None:
@@ -252,6 +265,7 @@ class TypoChatPlugin(GeneralPlugin):
         self._state.reset_system_prompt_to_default()
         self.w.systemPrompt.set(self._state.settings["systemPrompt"])
         self.w.inputField.set("")
+        self.w.tokenUsageLabel.set(self._state.usage_caption())
         self._save_settings_from_ui()
 
     @objc.python_method

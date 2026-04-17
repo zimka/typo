@@ -13,6 +13,19 @@ DEFAULT_SYSTEM_PROMPT = (
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_TOKENS = "2048"
 
+# Anthropic Messages API; used for prompt caching and request compatibility.
+ANTHROPIC_VERSION = "2023-06-01"
+
+# Prompt caching: 1h TTL (see Anthropic prompt caching docs).
+DEFAULT_CACHE_CONTROL = {"type": "ephemeral", "ttl": "1h"}
+
+_USAGE_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+
 
 def _messages_endpoint(base_url):
     base = (base_url or "").strip().rstrip("/")
@@ -69,7 +82,56 @@ def parse_max_tokens(raw, default_str=DEFAULT_MAX_TOKENS):
         return int(default_str)
 
 
-def build_messages_request_body(model, max_tokens, messages, system_text):
+def normalize_usage(usage):
+    """Return Anthropic ``usage`` dict with known integer keys defaulting to 0."""
+    out = {k: 0 for k in _USAGE_KEYS}
+    if not isinstance(usage, dict):
+        return out
+    for k in _USAGE_KEYS:
+        v = usage.get(k)
+        if v is None:
+            continue
+        try:
+            out[k] = max(0, int(v))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def format_usage_caption(last_usage, session_totals):
+    """
+    One-line English caption for the token usage TextBox.
+    ``session_totals`` is a dict of summed normalize_usage keys (same as _USAGE_KEYS).
+    """
+    z = {k: 0 for k in _USAGE_KEYS}
+    if isinstance(session_totals, dict):
+        for k in _USAGE_KEYS:
+            try:
+                z[k] = max(0, int(session_totals.get(k, 0)))
+            except (TypeError, ValueError):
+                z[k] = 0
+
+    def fmt(n):
+        n = int(n)
+        if n >= 10000:
+            return "%.1fk" % (n / 1000.0)
+        return str(n)
+
+    sess_in = z["input_tokens"] + z["cache_read_input_tokens"] + z["cache_creation_input_tokens"]
+    sess_out = z["output_tokens"]
+    session_part = "session: %s in + %s out" % (fmt(sess_in), fmt(sess_out))
+
+    if last_usage is None:
+        return "Tokens — last: — · %s" % session_part
+
+    lu = normalize_usage(last_usage)
+    last_in = lu["input_tokens"] + lu["cache_read_input_tokens"] + lu["cache_creation_input_tokens"]
+    last_out = lu["output_tokens"]
+    last_part = "last: %s in + %s out" % (fmt(last_in), fmt(last_out))
+    return "Tokens — %s · %s" % (last_part, session_part)
+
+
+def build_messages_request_body(model, max_tokens, messages, system_text, cache_control=None):
     body = {
         "model": model,
         "max_tokens": max_tokens,
@@ -77,6 +139,8 @@ def build_messages_request_body(model, max_tokens, messages, system_text):
     }
     if system_text:
         body["system"] = system_text
+    if cache_control:
+        body["cache_control"] = cache_control
     return body
 
 
@@ -97,6 +161,7 @@ def post_messages_request(body, url, auth_value):
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
+    req.add_header("anthropic-version", ANTHROPIC_VERSION)
     req.add_header("Authorization", "OAuth %s" % auth_value.strip())
     with urllib.request.urlopen(req, timeout=600, context=ssl_context()) as resp:
         raw = resp.read().decode("utf-8", errors="replace")
