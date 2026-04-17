@@ -1,18 +1,33 @@
 # encoding: utf-8
-"""Typo Chat — Messages API (Claude-compatible) with configurable base URL and OAuth key."""
+"""Typo Chat — agentic Messages API (Claude-compatible) with tool use and human-in-the-loop."""
 
 import threading
 
 import objc
-from AppKit import NSAlert, NSMenuItem
-from Foundation import NSOperationQueue
+from AppKit import (
+    NSAlert,
+    NSAttributedString,
+    NSBlockOperation,
+    NSColor,
+    NSFont,
+    NSImage,
+    NSMenuItem,
+    NSTextAttachment,
+)
+from Foundation import NSData, NSOperationQueue, NSSize
 from GlyphsApp import Glyphs, WINDOW_MENU
 from GlyphsApp.plugins import GeneralPlugin
 from vanilla import Button, EditText, TextBox, TextEditor, Window
 
+import tools
 from state import ChatState, migration_default_strings
 
 _DEFAULTS_PREFIX = "com.typo."
+
+PLUGIN_VERSION = "0.2.2-phase1"
+
+_TRANSCRIPT_IMAGE_MAX_W = 440
+_TRANSCRIPT_IMAGE_MAX_H = 140
 
 
 def _defaults_key(name):
@@ -40,7 +55,6 @@ def _set_default(name, value):
 
 
 def _show_alert(title, text):
-    """Modal dialog; ``Glyphs.showMessage`` is not available on all Glyphs builds."""
     alert = NSAlert.alloc().init()
     alert.setMessageText_(title)
     alert.setInformativeText_(text)
@@ -48,19 +62,51 @@ def _show_alert(title, text):
 
 
 def _load_persistent_settings(state):
-    """Load settings from JSON blob, or migrate from legacy flat keys if blob is absent."""
+    """Load baseUrl / apiKey / model / maxTokens from Glyphs.defaults.
+
+    ``systemPrompt`` is intentionally NOT loaded during active development, so that updates
+    to ``DEFAULT_SYSTEM_PROMPT`` in :mod:`utils` take effect on the next Glyphs launch.
+    """
     blob = _get_default("settingsJson", "")
     if blob and str(blob).strip():
         state.set_settings_json(str(blob))
     else:
-        dm, dmt, dsp = migration_default_strings()
+        dm, dmt, _dsp = migration_default_strings()
         state.migrate_from_legacy_flat(
             baseUrl=_get_default("baseUrl", ""),
             apiKey=_get_default("apiKey", ""),
             model=_get_default("model", dm),
             maxTokens=_get_default("maxTokens", dmt),
-            systemPrompt=_get_default("systemPrompt", dsp),
         )
+
+
+def _run_on_main_sync(fn):
+    """Execute ``fn()`` synchronously on the main thread and return its value. Propagates errors."""
+    box = {}
+
+    def wrapper():
+        try:
+            box["value"] = fn()
+        except BaseException as e:
+            box["error"] = e
+
+    op = NSBlockOperation.blockOperationWithBlock_(wrapper)
+    NSOperationQueue.mainQueue().addOperations_waitUntilFinished_([op], True)
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def _brief_json(value, limit=180):
+    import json
+
+    try:
+        s = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        s = str(value)
+    if len(s) > limit:
+        s = s[:limit] + "…"
+    return s
 
 
 class TypoChatPlugin(GeneralPlugin):
@@ -68,23 +114,21 @@ class TypoChatPlugin(GeneralPlugin):
     _frame_autosave_set = False
 
     @objc.python_method
-    def _transcript_text_from_messages(self):
-        parts = []
-        for m in self._state.messages:
-            role = m.get("role")
-            c = m.get("content") or ""
-            if role == "user":
-                parts.append("You: %s\n" % c)
-            elif role == "assistant":
-                parts.append("Assistant: %s\n\n" % c)
-        return "".join(parts)
+    def _font_provider(self):
+        return Glyphs.font
+
+    @objc.python_method
+    def _build_tool_context(self):
+        return tools.ToolContext(
+            font_provider=self._font_provider,
+            render_contract=tools.DEFAULT_RENDER_CONTRACT,
+        )
 
     @objc.python_method
     def _build_window(self):
-        """Create or replace ``self.w``. Vanilla forbids ``open()`` after close; rebuild when ``_window`` is None."""
         self._frame_autosave_set = False
         s = self._state.settings
-        self.w = Window((600, 792), self.name, minSize=(560, 712))
+        self.w = Window((620, 848), self.name, minSize=(580, 740))
 
         y = 12
         self.w.baseUrlLabel = TextBox((12, y, 300, 14), "Base URL (POST → …/v1/messages)")
@@ -128,21 +172,21 @@ class TypoChatPlugin(GeneralPlugin):
         self.w.systemLabel = TextBox((12, y, 200, 14), "System prompt")
         y += 18
         self.w.systemPrompt = TextEditor(
-            (12, y, -12, 72),
+            (12, y, -12, 96),
             text=s["systemPrompt"],
             checksSpelling=True,
         )
-        y += 80
+        y += 104
 
         self.w.transcriptLabel = TextBox((12, y, 200, 14), "Transcript")
         y += 18
         self.w.transcript = TextEditor(
-            (12, y, -12, 200),
-            text=self._transcript_text_from_messages(),
+            (12, y, -12, 260),
+            text="",
             readOnly=True,
             checksSpelling=False,
         )
-        y += 208
+        y += 268
 
         self.w.inputLabel = TextBox((12, y, 200, 14), "Message")
         y += 18
@@ -157,14 +201,39 @@ class TypoChatPlugin(GeneralPlugin):
         y += 32
 
         self.w.sendButton = Button(
-            (12, y, 120, 22),
+            (12, y, 100, 22),
             "Send",
             callback=self._on_send_,
         )
+        self.w.approveButton = Button(
+            (120, y, 90, 22),
+            "Approve",
+            callback=self._on_approve_,
+        )
+        self.w.approveButton.enable(False)
+        self.w.rejectButton = Button(
+            (218, y, 90, 22),
+            "Reject",
+            callback=self._on_reject_,
+        )
+        self.w.rejectButton.enable(False)
+        self.w.cancelButton = Button(
+            (316, y, 90, 22),
+            "Cancel",
+            callback=self._on_cancel_,
+        )
+        self.w.cancelButton.enable(False)
         self.w.newChatButton = Button(
-            (140, y, 120, 22),
+            (-112, y, 100, 22),
             "New chat",
             callback=self._on_new_chat_,
+        )
+
+        self.w.versionLabel = TextBox(
+            (12, -20, -12, 14),
+            "TypoChat v%s" % PLUGIN_VERSION,
+            sizeStyle="small",
+            alignment="right",
         )
 
     @objc.python_method
@@ -179,6 +248,9 @@ class TypoChatPlugin(GeneralPlugin):
         )
         self._state = ChatState()
         _load_persistent_settings(self._state)
+        self._tool_ctx = self._build_tool_context()
+        self._cancel_event = None
+        self._worker_busy = False
         self._build_window()
 
     @objc.python_method
@@ -217,55 +289,213 @@ class TypoChatPlugin(GeneralPlugin):
         _set_default("settingsJson", self._state.get_settings_json())
 
     @objc.python_method
-    def _append_transcript(self, block):
-        prev = self.w.transcript.get() or ""
-        self.w.transcript.set((prev + block) if prev else block)
+    def _transcript_text_view(self):
+        try:
+            return self.w.transcript.getNSTextView()
+        except Exception:
+            return None
 
     @objc.python_method
-    def _run_on_main(self, fn):
-        NSOperationQueue.mainQueue().addOperationWithBlock_(fn)
+    def _append_plain_text(self, text, color=None):
+        tv = self._transcript_text_view()
+        if tv is None:
+            return
+        attrs = {}
+        # Default to the system adaptive text color so the transcript is readable in both
+        # light and dark appearance (see debug log 2025-04-17: NSTextView.textColor is None
+        # by default, so attributed strings without NSColor render as static black).
+        attrs["NSColor"] = color if color is not None else NSColor.textColor()
+        body_font = NSFont.userFontOfSize_(12.0)
+        if body_font is not None:
+            attrs["NSFont"] = body_font
+        attr_str = NSAttributedString.alloc().initWithString_attributes_(text, attrs)
+        tv.textStorage().appendAttributedString_(attr_str)
+
+    @objc.python_method
+    def _append_image(self, png_bytes):
+        tv = self._transcript_text_view()
+        if tv is None or not png_bytes:
+            return
+        data = NSData.dataWithBytes_length_(png_bytes, len(png_bytes))
+        img = NSImage.alloc().initWithData_(data)
+        if img is None:
+            return
+        sz = img.size()
+        w, h = float(sz.width), float(sz.height)
+        if w > 0 and h > 0:
+            scale = min(_TRANSCRIPT_IMAGE_MAX_W / w, _TRANSCRIPT_IMAGE_MAX_H / h, 1.0)
+            img.setSize_(NSSize(int(w * scale), int(h * scale)))
+        attachment = NSTextAttachment.alloc().init()
+        attachment.setImage_(img)
+        attr = NSAttributedString.attributedStringWithAttachment_(attachment)
+        tv.textStorage().appendAttributedString_(attr)
+        self._append_plain_text("\n")
+
+    @objc.python_method
+    def _scroll_to_end(self):
+        tv = self._transcript_text_view()
+        if tv is None:
+            return
+        length = tv.textStorage().length()
+        tv.scrollRangeToVisible_((length, 0))
+
+    @objc.python_method
+    def _set_busy(self, busy):
+        self._worker_busy = busy
+        self.w.sendButton.enable(not busy)
+        self.w.cancelButton.enable(busy)
+        if busy:
+            self.w.approveButton.enable(False)
+            self.w.rejectButton.enable(False)
+
+    @objc.python_method
+    def _on_event(self, event):
+        """Dispatched on main thread. ``event`` is a dict (see ``ChatState.run_agent_turn``)."""
+        kind = event.get("kind")
+
+        if kind == "user":
+            self._append_plain_text("You: %s\n" % event.get("text", ""))
+        elif kind == "assistant_text":
+            text = event.get("text") or ""
+            if text:
+                self._append_plain_text("Assistant: %s\n" % text)
+        elif kind == "tool_use":
+            line = "[tool_use] %s(%s)\n" % (
+                event.get("name", "?"),
+                _brief_json(event.get("input") or {}),
+            )
+            self._append_plain_text(line, color=NSColor.systemBlueColor())
+        elif kind == "tool_result":
+            blocks = event.get("content") or []
+            is_error = bool(event.get("is_error"))
+            prefix = "[tool_result%s] %s:\n" % (
+                " error" if is_error else "",
+                event.get("name", "?"),
+            )
+            self._append_plain_text(
+                prefix,
+                color=NSColor.systemRedColor() if is_error else NSColor.systemGrayColor(),
+            )
+            for b in blocks:
+                btype = b.get("type")
+                if btype == "text":
+                    self._append_plain_text((b.get("text") or "") + "\n")
+                elif btype == "image":
+                    src = b.get("source") or {}
+                    if src.get("type") == "base64":
+                        import base64
+
+                        try:
+                            raw = base64.b64decode(src.get("data") or "")
+                        except Exception:
+                            raw = b""
+                        if raw:
+                            self._append_image(raw)
+        elif kind == "approval_required":
+            self._append_plain_text(
+                "\n[waiting for Approve / Reject]\n",
+                color=NSColor.systemOrangeColor(),
+            )
+            self.w.approveButton.enable(True)
+            self.w.rejectButton.enable(True)
+        elif kind == "usage_updated":
+            self.w.tokenUsageLabel.set(self._state.usage_caption())
+        elif kind == "done":
+            reason = event.get("stop_reason") or "end_turn"
+            self._append_plain_text("\n[turn finished: %s]\n\n" % reason)
+        elif kind == "iteration_limit":
+            self._append_plain_text(
+                "\n[iteration limit reached]\n\n",
+                color=NSColor.systemOrangeColor(),
+            )
+        elif kind == "cancelled":
+            self._append_plain_text("\n[cancelled by user]\n\n", color=NSColor.systemOrangeColor())
+        elif kind == "error":
+            self._append_plain_text(
+                "\n[error] %s\n\n" % (event.get("text") or ""),
+                color=NSColor.systemRedColor(),
+            )
+
+        self._scroll_to_end()
+
+    @objc.python_method
+    def _dispatch_event(self, event):
+        NSOperationQueue.mainQueue().addOperationWithBlock_(lambda: self._on_event(event))
+
+    @objc.python_method
+    def _tool_executor(self, name, args):
+        return _run_on_main_sync(lambda: tools.execute_tool(name, args, self._tool_ctx))
+
+    @objc.python_method
+    def _start_turn(self, user_text):
+        if self._worker_busy:
+            return
+        self._save_settings_from_ui()
+        err = self._state.validate_setting_errors()
+        if err:
+            _show_alert("Typo Chat", err)
+            return
+        self._cancel_event = threading.Event()
+        self._set_busy(True)
+
+        def worker():
+            try:
+                self._state.run_agent_turn(
+                    user_text=user_text,
+                    tool_executor=self._tool_executor,
+                    tool_schemas=tools.TOOL_SCHEMAS,
+                    on_event=self._dispatch_event,
+                    cancel_event=self._cancel_event,
+                )
+            except Exception as e:
+                self._dispatch_event({"kind": "error", "text": str(e)})
+            finally:
+                NSOperationQueue.mainQueue().addOperationWithBlock_(
+                    lambda: self._set_busy(False)
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
 
     @objc.python_method
     def _on_send_(self, sender):
         text = (self.w.inputField.get() or "").strip()
         if not text:
             return
-
-        self._save_settings_from_ui()
-        err = self._state.validate_setting_errors()
-        if err:
-            _show_alert("Typo Chat", err)
-            return
-
-        self._state.append_user(text)
-        self._append_transcript("You: %s\n" % text)
         self.w.inputField.set("")
-        self.w.sendButton.enable(False)
+        self._start_turn(text)
 
-        def worker():
-            reply_text, err_out, _usage = self._state.send_messages_request_and_append_assistant()
+    @objc.python_method
+    def _on_approve_(self, sender):
+        self.w.approveButton.enable(False)
+        self.w.rejectButton.enable(False)
+        self._start_turn("approve")
 
-            def finish():
-                self.w.sendButton.enable(True)
-                # On API errors, last successful usage stays in _state (not overwritten).
-                self.w.tokenUsageLabel.set(self._state.usage_caption())
-                if err_out:
-                    self._append_transcript("%s\n\n" % err_out)
-                elif reply_text is not None:
-                    self._append_transcript("Assistant: %s\n\n" % reply_text)
+    @objc.python_method
+    def _on_reject_(self, sender):
+        self.w.approveButton.enable(False)
+        self.w.rejectButton.enable(False)
+        self._start_turn("reject — please revise the plan and propose another approach")
 
-            self._run_on_main(finish)
-
-        threading.Thread(target=worker, daemon=True).start()
+    @objc.python_method
+    def _on_cancel_(self, sender):
+        if self._cancel_event is not None:
+            self._cancel_event.set()
+        self.w.cancelButton.enable(False)
 
     @objc.python_method
     def _on_new_chat_(self, sender):
+        if self._worker_busy and self._cancel_event is not None:
+            self._cancel_event.set()
         self._state.clear()
-        self.w.transcript.set("")
+        tv = self._transcript_text_view()
+        if tv is not None:
+            tv.textStorage().setAttributedString_(NSAttributedString.alloc().initWithString_(""))
         self._state.reset_system_prompt_to_default()
         self.w.systemPrompt.set(self._state.settings["systemPrompt"])
         self.w.inputField.set("")
         self.w.tokenUsageLabel.set(self._state.usage_caption())
+        self.w.approveButton.enable(False)
+        self.w.rejectButton.enable(False)
         self._save_settings_from_ui()
 
     @objc.python_method
