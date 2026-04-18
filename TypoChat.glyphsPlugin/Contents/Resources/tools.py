@@ -1,14 +1,22 @@
 # encoding: utf-8
 """
-Agent tools for Typo Chat (Phase 1).
+Agent tools for Typo Chat (Phase 2).
 
-Five tools are exposed to the model via Anthropic ``tools`` parameter:
+Eight tools are exposed to the model via Anthropic ``tools`` parameter:
 
+Read-only:
 - ``list_masters``       — enumerate masters of the current font.
 - ``list_glyphs``        — list glyph names (optional substring filter).
 - ``get_glyph``          — dump a glyph's paths/nodes/anchors/metrics as text.
 - ``render_specimen``    — rasterize a text using the current font state (returns PNG).
+
+Edit:
 - ``move_nodes_where``   — move nodes in ``glyph@master`` whose coordinates match a predicate.
+
+Snapshot / diff:
+- ``save_snapshot``      — capture geometry of the listed glyphs (one slot, overwrites).
+- ``reset_snapshot``     — restore the saved geometry (revert edits).
+- ``diff_pre_post``      — render pre (from snapshot), post (live), and R/G overlay.
 
 The rendering and Glyphs-SDK code paths import ``AppKit`` / ``GlyphsApp`` lazily so this
 module can still be imported from non-Glyphs unit tests.
@@ -107,7 +115,8 @@ TOOL_SCHEMAS = [
         "description": (
             "Move nodes of a glyph at a specific master whose coordinates match 'predicate' "
             "by 'delta'. Only integer coordinates are matched (no tolerance). Use this as "
-            "the single edit primitive: one call should do one atomic geometric change."
+            "the single edit primitive: one call should do one atomic geometric change. "
+            "Call save_snapshot FIRST before any move_nodes_where so the user can undo."
         ),
         "input_schema": {
             "type": "object",
@@ -134,15 +143,63 @@ TOOL_SCHEMAS = [
             "required": ["glyph", "master", "predicate", "delta"],
         },
     },
+    {
+        "name": "save_snapshot",
+        "description": (
+            "Capture the current geometry (node positions, anchors, widths across all masters) "
+            "of the listed glyphs. One slot only — a second call overwrites. You MUST call "
+            "this BEFORE the first move_nodes_where in a fix so the user (or you) can revert "
+            "via reset_snapshot and so diff_pre_post can render the before/after comparison."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "glyph_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Glyph names you plan to edit. Must be non-empty.",
+                }
+            },
+            "required": ["glyph_names"],
+        },
+    },
+    {
+        "name": "reset_snapshot",
+        "description": (
+            "Restore the geometry saved by save_snapshot. Use when your edits went the wrong "
+            "way and you want to revise the plan, or to undo an exploratory attempt. The "
+            "snapshot itself is kept (a reset can be applied multiple times)."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "diff_pre_post",
+        "description": (
+            "Render the specimen three times into one reply: pre (from the active snapshot), "
+            "post (from the live current font), and an R/G overlay (red = pre, green = post, "
+            "yellow = both) on a black background. Requires an active snapshot — call "
+            "save_snapshot first."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Specimen text (same as was used for render_specimen)."},
+                "master": {"type": "string", "description": "Master name or id. Defaults to the first master."},
+                "size": {"type": "integer", "description": "Em size in pixels. Default 160."},
+            },
+            "required": ["text"],
+        },
+    },
 ]
 
 
 class ToolContext:
     """Plugin-level state passed to every tool call."""
 
-    def __init__(self, font_provider, render_contract=None):
+    def __init__(self, font_provider, render_contract=None, snapshot_store=None):
         self._font_provider = font_provider
         self.render_contract = dict(render_contract or DEFAULT_RENDER_CONTRACT)
+        self.snapshot_store = snapshot_store if snapshot_store is not None else SnapshotStore()
 
     @property
     def font(self):
@@ -293,12 +350,87 @@ def _handle_move_nodes_where(args, ctx, font):
     return "\n".join(lines)
 
 
+def _handle_save_snapshot(args, ctx, font):
+    names_raw = args.get("glyph_names")
+    if isinstance(names_raw, str):
+        names_raw = [names_raw]
+    if not isinstance(names_raw, list) or not names_raw:
+        return "[error] 'glyph_names' must be a non-empty list of glyph names."
+    names = [str(n).strip() for n in names_raw if str(n).strip()]
+    if not names:
+        return "[error] 'glyph_names' must contain non-empty strings."
+    missing = [n for n in names if _resolve_glyph(font, n) is None]
+    if missing:
+        return "[error] Glyph not found: %s" % ", ".join(missing)
+
+    had_prev = ctx.snapshot_store.has_snapshot()
+    info = ctx.snapshot_store.save(font, names)
+    prefix = "Overwrote previous snapshot. " if had_prev else ""
+    return "%sSnapshot saved for %d glyph(s) across %d layer(s): %s" % (
+        prefix,
+        len(info["glyph_names"]),
+        info["layers"],
+        ", ".join(info["glyph_names"]),
+    )
+
+
+def _handle_reset_snapshot(args, ctx, font):
+    if not ctx.snapshot_store.has_snapshot():
+        return "[error] No active snapshot — call save_snapshot first."
+    info = ctx.snapshot_store.reset(font)
+    return "Snapshot restored: %d glyph(s) reverted (%s). Snapshot is still active." % (
+        len(info["glyph_names"]),
+        ", ".join(info["glyph_names"]),
+    )
+
+
+def _handle_diff_pre_post(args, ctx, font):
+    text = str(args.get("text") or "")
+    if not text:
+        return "[error] 'text' is required."
+    master = _resolve_master(font, args.get("master"))
+    if master is None:
+        return "[error] Master not found: %s" % args.get("master")
+    if not ctx.snapshot_store.has_snapshot():
+        return "[error] No active snapshot — call save_snapshot([...]) before diff_pre_post."
+
+    contract = dict(ctx.render_contract)
+    size = args.get("size")
+    if size is not None:
+        try:
+            contract["em_px"] = float(size)
+        except (TypeError, ValueError):
+            return "[error] 'size' must be a number."
+
+    store = ctx.snapshot_store
+    pre_png = store.render_pre(font, master, text, contract)
+    post_png = _render_layer_run(font, master, text, contract)
+    overlay_png = _render_overlay_run(font, master, text, contract, store)
+    header = "diff_pre_post master=%s text=%r snapshot_glyphs=%s" % (
+        master.name,
+        text,
+        list(store._glyph_names),
+    )
+    return [
+        header,
+        "pre (snapshot):",
+        pre_png,
+        "post (live):",
+        post_png,
+        "overlay (red=pre, green=post, yellow=overlap):",
+        overlay_png,
+    ]
+
+
 _HANDLERS = {
     "list_masters": _handle_list_masters,
     "list_glyphs": _handle_list_glyphs,
     "get_glyph": _handle_get_glyph,
     "render_specimen": _handle_render_specimen,
     "move_nodes_where": _handle_move_nodes_where,
+    "save_snapshot": _handle_save_snapshot,
+    "reset_snapshot": _handle_reset_snapshot,
+    "diff_pre_post": _handle_diff_pre_post,
 }
 
 
@@ -388,6 +520,171 @@ def _point(x, y):
         return _PyPoint(x, y)
 
 
+# ---------------------------------------------------------------------------
+# Snapshot store: one slot of per-glyph-per-master geometry (node positions,
+# anchors, widths). Sufficient to undo any move_nodes_where sequence because
+# that tool only changes positions, not topology. Stored as plain dicts so we
+# don't keep references to Objective-C objects and the snapshot survives any
+# subsequent Glyphs-internal mutations.
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_layer_data(layer):
+    paths = []
+    for path in (layer.paths or []):
+        nodes = []
+        for node in (path.nodes or []):
+            nodes.append(
+                {"x": float(node.position.x), "y": float(node.position.y)}
+            )
+        paths.append({"nodes": nodes})
+    anchors = []
+    for anchor in (getattr(layer, "anchors", None) or []):
+        try:
+            nm = anchor.name
+        except Exception:
+            nm = None
+        if not nm:
+            continue
+        anchors.append(
+            {"name": nm, "x": float(anchor.position.x), "y": float(anchor.position.y)}
+        )
+    width = None
+    try:
+        width = float(layer.width)
+    except Exception:
+        pass
+    return {"paths": paths, "anchors": anchors, "width": width}
+
+
+def _apply_layer_data(layer, data):
+    live_paths = list(layer.paths or [])
+    snap_paths = data.get("paths") or []
+    for pi, path in enumerate(live_paths):
+        if pi >= len(snap_paths):
+            break
+        snap_nodes = snap_paths[pi].get("nodes") or []
+        live_nodes = list(path.nodes or [])
+        for ni, node in enumerate(live_nodes):
+            if ni >= len(snap_nodes):
+                break
+            sn = snap_nodes[ni]
+            node.position = _point(sn["x"], sn["y"])
+    w = data.get("width")
+    if w is not None:
+        try:
+            layer.width = w
+        except Exception:
+            pass
+    snap_anchors_by_name = {
+        a["name"]: a for a in (data.get("anchors") or []) if a.get("name")
+    }
+    for anchor in (getattr(layer, "anchors", None) or []):
+        try:
+            nm = anchor.name
+        except Exception:
+            nm = None
+        if not nm:
+            continue
+        sa = snap_anchors_by_name.get(nm)
+        if sa is None:
+            continue
+        anchor.position = _point(sa["x"], sa["y"])
+
+
+def _snapshot_glyphs(font, glyph_names):
+    """Return ``{glyph_name: {master_id: layer_data}}`` for the requested glyphs."""
+    out = {}
+    for name in glyph_names:
+        glyph = _resolve_glyph(font, name)
+        if glyph is None:
+            continue
+        layers = {}
+        for master in font.masters:
+            try:
+                layer = glyph.layers[master.id]
+            except Exception:
+                layer = None
+            if layer is None:
+                continue
+            layers[master.id] = _snapshot_layer_data(layer)
+        out[name] = layers
+    return out
+
+
+def _apply_snapshot(font, snapshot):
+    """Apply a snapshot back into the font's live layers."""
+    if not snapshot:
+        return
+    for name, layers in snapshot.items():
+        glyph = _resolve_glyph(font, name)
+        if glyph is None:
+            continue
+        for master_id, data in layers.items():
+            try:
+                layer = glyph.layers[master_id]
+            except Exception:
+                layer = None
+            if layer is None:
+                continue
+            _apply_layer_data(layer, data)
+
+
+class SnapshotStore:
+    """One-slot geometry snapshot for a subset of glyphs.
+
+    - ``save(font, glyph_names)``: capture node positions / anchors / widths for all
+      masters of the listed glyphs. Overwrites any previous snapshot.
+    - ``reset(font)``: write the snapshot back into the live font. The snapshot is
+      kept — resetting twice is allowed.
+    - ``render_pre(font, master, text, contract)``: temporarily install the snapshot
+      into the live font, render, then restore the live state. Used by ``diff_pre_post``.
+    - ``has_snapshot()`` / ``clear()``: lifecycle helpers.
+    """
+
+    def __init__(self):
+        self._slot = None
+        self._glyph_names = []
+
+    def has_snapshot(self):
+        return self._slot is not None
+
+    def clear(self):
+        self._slot = None
+        self._glyph_names = []
+
+    def save(self, font, glyph_names):
+        names = [str(n).strip() for n in (glyph_names or []) if str(n).strip()]
+        if not names:
+            raise ValueError("glyph_names must be a non-empty list")
+        self._slot = _snapshot_glyphs(font, names)
+        self._glyph_names = names
+        layers_count = sum(len(v) for v in self._slot.values())
+        return {"glyph_names": list(names), "layers": layers_count}
+
+    def reset(self, font):
+        if not self.has_snapshot():
+            raise ValueError("no active snapshot")
+        _apply_snapshot(font, self._slot)
+        return {"glyph_names": list(self._glyph_names)}
+
+    def render_pre(self, font, master, text, contract):
+        """Render ``text`` as if the snapshot were the current font state.
+
+        Strategy: snapshot current geometry for the same glyphs, apply the stored
+        snapshot, render, then restore the current geometry. This is synchronous on
+        the main thread, so no intermediate UI frame is observable.
+        """
+        if not self.has_snapshot():
+            raise ValueError("no active snapshot")
+        current = _snapshot_glyphs(font, self._glyph_names)
+        _apply_snapshot(font, self._slot)
+        try:
+            return _render_layer_run(font, master, text, contract)
+        finally:
+            _apply_snapshot(font, current)
+
+
 def _dump_layer(glyph, master, layer):
     uni = (glyph.unicode or "") if hasattr(glyph, "unicode") else ""
     header = "glyph: %s%s" % (glyph.name, (" U+" + uni) if uni else "")
@@ -438,30 +735,8 @@ def _fmt_num(v):
     return "%.3f" % f
 
 
-def _render_layer_run(font, master, text, contract):
-    """Rasterize ``text`` using the current outlines at ``master``. Returns PNG bytes."""
-    from AppKit import (
-        NSAffineTransform,
-        NSBezierPath,
-        NSBitmapImageRep,
-        NSColor,
-        NSDeviceRGBColorSpace,
-        NSGraphicsContext,
-    )
-
-    canvas_w = int(contract.get("canvas_w", 900))
-    canvas_h = int(contract.get("canvas_h", 260))
-    margin_x = int(contract.get("margin_x", 24))
-    em_px = float(contract.get("em_px", 160.0))
-    baseline_y = float(contract.get("baseline_y", 56.0))
-    unknown_advance_upm = float(contract.get("unknown_advance_upm", 250.0))
-
-    upm_raw = getattr(font, "upm", 1000) or 1000
-    try:
-        upm = float(upm_raw)
-    except (TypeError, ValueError):
-        upm = 1000.0
-    scale = em_px / upm
+def _make_bitmap_rep(canvas_w, canvas_h):
+    from AppKit import NSBitmapImageRep, NSDeviceRGBColorSpace
 
     rep = (
         NSBitmapImageRep.alloc()
@@ -480,7 +755,78 @@ def _render_layer_run(font, master, text, contract):
     )
     if rep is None:
         raise RuntimeError("failed to allocate NSBitmapImageRep")
+    return rep
 
+
+def _encode_png(rep):
+    png_type = 4  # NSBitmapImageFileTypePNG
+    png_data = rep.representationUsingType_properties_(png_type, {})
+    if png_data is None:
+        raise RuntimeError("failed to encode PNG")
+    return bytes(png_data)
+
+
+def _draw_glyphs_run(font, master, text, contract):
+    """Draw the specimen glyph outlines onto the current NSGraphicsContext, filled with
+    the currently set color. Factored out so both plain rendering and the R/G overlay
+    can reuse the exact same layout and glyph-lookup logic."""
+    from AppKit import NSAffineTransform
+
+    canvas_w = int(contract.get("canvas_w", 900))
+    margin_x = int(contract.get("margin_x", 24))
+    em_px = float(contract.get("em_px", 160.0))
+    baseline_y = float(contract.get("baseline_y", 56.0))
+    unknown_advance_upm = float(contract.get("unknown_advance_upm", 250.0))
+
+    upm_raw = getattr(font, "upm", 1000) or 1000
+    try:
+        upm = float(upm_raw)
+    except (TypeError, ValueError):
+        upm = 1000.0
+    scale = em_px / upm
+
+    x = float(margin_x)
+    right_limit = float(canvas_w - margin_x)
+    for ch in text:
+        glyph = _lookup_char(font, ch)
+        layer = None
+        if glyph is not None:
+            try:
+                layer = glyph.layers[master.id]
+            except Exception:
+                layer = None
+
+        if layer is not None:
+            try:
+                path = layer.completeBezierPath
+            except Exception:
+                path = None
+            if path is not None:
+                tr = NSAffineTransform.alloc().init()
+                tr.translateXBy_yBy_(x, baseline_y)
+                tr.scaleXBy_yBy_(scale, scale)
+                transformed = tr.transformBezierPath_(path)
+                transformed.fill()
+            try:
+                adv = float(layer.width)
+            except Exception:
+                adv = unknown_advance_upm
+            x += adv * scale
+        else:
+            x += unknown_advance_upm * scale
+
+        if x > right_limit:
+            break
+
+
+def _render_layer_run(font, master, text, contract):
+    """Rasterize ``text`` using the current outlines at ``master``. Returns PNG bytes."""
+    from AppKit import NSBezierPath, NSColor, NSGraphicsContext
+
+    canvas_w = int(contract.get("canvas_w", 900))
+    canvas_h = int(contract.get("canvas_h", 260))
+
+    rep = _make_bitmap_rep(canvas_w, canvas_h)
     gc = NSGraphicsContext.graphicsContextWithBitmapImageRep_(rep)
     NSGraphicsContext.saveGraphicsState()
     NSGraphicsContext.setCurrentContext_(gc)
@@ -488,47 +834,54 @@ def _render_layer_run(font, master, text, contract):
         NSColor.whiteColor().set()
         NSBezierPath.bezierPathWithRect_(((0, 0), (canvas_w, canvas_h))).fill()
         NSColor.blackColor().set()
-
-        x = float(margin_x)
-        right_limit = float(canvas_w - margin_x)
-        for ch in text:
-            glyph = _lookup_char(font, ch)
-            layer = None
-            if glyph is not None:
-                try:
-                    layer = glyph.layers[master.id]
-                except Exception:
-                    layer = None
-
-            if layer is not None:
-                try:
-                    path = layer.completeBezierPath
-                except Exception:
-                    path = None
-                if path is not None:
-                    tr = NSAffineTransform.alloc().init()
-                    tr.translateXBy_yBy_(x, baseline_y)
-                    tr.scaleXBy_yBy_(scale, scale)
-                    transformed = tr.transformBezierPath_(path)
-                    transformed.fill()
-                try:
-                    adv = float(layer.width)
-                except Exception:
-                    adv = unknown_advance_upm
-                x += adv * scale
-            else:
-                x += unknown_advance_upm * scale
-
-            if x > right_limit:
-                break
+        _draw_glyphs_run(font, master, text, contract)
     finally:
         NSGraphicsContext.restoreGraphicsState()
 
-    png_type = 4
-    png_data = rep.representationUsingType_properties_(png_type, {})
-    if png_data is None:
-        raise RuntimeError("failed to encode PNG")
-    return bytes(png_data)
+    return _encode_png(rep)
+
+
+def _render_overlay_run(font, master, text, contract, store):
+    """Render the R/G overlay into one bitmap:
+    - Black background
+    - Pre (snapshot) pass: red ink, normal compositing (applied by temporarily swapping
+      snapshot into the live font and restoring afterwards).
+    - Post (live) pass: green ink, additive compositing (NSCompositingOperationPlusLighter),
+      so overlap of red+green becomes yellow.
+    Returns PNG bytes."""
+    from AppKit import NSBezierPath, NSColor, NSGraphicsContext
+
+    NS_COMPOSITING_PLUS_LIGHTER = 17  # NSCompositingOperationPlusLighter
+
+    canvas_w = int(contract.get("canvas_w", 900))
+    canvas_h = int(contract.get("canvas_h", 260))
+
+    rep = _make_bitmap_rep(canvas_w, canvas_h)
+    gc = NSGraphicsContext.graphicsContextWithBitmapImageRep_(rep)
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.setCurrentContext_(gc)
+    try:
+        NSColor.blackColor().set()
+        NSBezierPath.bezierPathWithRect_(((0, 0), (canvas_w, canvas_h))).fill()
+
+        # Pass 1 — pre (snapshot) in red. Temporarily apply snapshot to live font.
+        current_snap = _snapshot_glyphs(font, store._glyph_names)
+        _apply_snapshot(font, store._slot)
+        try:
+            NSColor.redColor().set()
+            NSGraphicsContext.currentContext().setCompositingOperation_(2)  # NSCompositingOperationSourceOver
+            _draw_glyphs_run(font, master, text, contract)
+        finally:
+            _apply_snapshot(font, current_snap)
+
+        # Pass 2 — post (live) in green, additive.
+        NSGraphicsContext.currentContext().setCompositingOperation_(NS_COMPOSITING_PLUS_LIGHTER)
+        NSColor.greenColor().set()
+        _draw_glyphs_run(font, master, text, contract)
+    finally:
+        NSGraphicsContext.restoreGraphicsState()
+
+    return _encode_png(rep)
 
 
 def _lookup_char(font, ch):

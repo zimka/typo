@@ -24,7 +24,7 @@ from state import ChatState, migration_default_strings
 
 _DEFAULTS_PREFIX = "com.typo."
 
-PLUGIN_VERSION = "0.2.2-phase1"
+PLUGIN_VERSION = "0.3.2-phase2"
 
 _TRANSCRIPT_IMAGE_MAX_W = 440
 _TRANSCRIPT_IMAGE_MAX_H = 140
@@ -81,7 +81,11 @@ def _load_persistent_settings(state):
 
 
 def _run_on_main_sync(fn):
-    """Execute ``fn()`` synchronously on the main thread and return its value. Propagates errors."""
+    """Execute ``fn()`` synchronously on the main thread and return its value.
+
+    MUST be called from a background thread only — calling this from the main thread
+    self-waits on ``addOperations_waitUntilFinished_`` and deadlocks the UI.
+    """
     box = {}
 
     def wrapper():
@@ -122,13 +126,14 @@ class TypoChatPlugin(GeneralPlugin):
         return tools.ToolContext(
             font_provider=self._font_provider,
             render_contract=tools.DEFAULT_RENDER_CONTRACT,
+            snapshot_store=tools.SnapshotStore(),
         )
 
     @objc.python_method
     def _build_window(self):
         self._frame_autosave_set = False
         s = self._state.settings
-        self.w = Window((620, 848), self.name, minSize=(580, 740))
+        self.w = Window((620, 880), self.name, minSize=(580, 760))
 
         y = 12
         self.w.baseUrlLabel = TextBox((12, y, 300, 14), "Base URL (POST → …/v1/messages)")
@@ -228,6 +233,18 @@ class TypoChatPlugin(GeneralPlugin):
             "New chat",
             callback=self._on_new_chat_,
         )
+        y += 28
+        self.w.resetSnapshotButton = Button(
+            (12, y, 160, 22),
+            "Reset snapshot",
+            callback=self._on_reset_snapshot_,
+        )
+        self.w.resetSnapshotButton.enable(False)
+        self.w.snapshotStatus = TextBox(
+            (180, y + 3, -12, 16),
+            "No snapshot saved.",
+            sizeStyle="small",
+        )
 
         self.w.versionLabel = TextBox(
             (12, -20, -12, 14),
@@ -276,6 +293,7 @@ class TypoChatPlugin(GeneralPlugin):
                 ns_win.setFrameAutosaveName_(self.windowName)
                 self._frame_autosave_set = True
             ns_win.makeKeyAndOrderFront_(self)
+        self._refresh_snapshot_ui()
 
     @objc.python_method
     def _save_settings_from_ui(self):
@@ -347,6 +365,21 @@ class TypoChatPlugin(GeneralPlugin):
         if busy:
             self.w.approveButton.enable(False)
             self.w.rejectButton.enable(False)
+        self._refresh_snapshot_ui()
+
+    @objc.python_method
+    def _refresh_snapshot_ui(self):
+        store = getattr(self._tool_ctx, "snapshot_store", None)
+        has = bool(store and store.has_snapshot())
+        self.w.resetSnapshotButton.enable(has and not self._worker_busy)
+        if has:
+            names = list(getattr(store, "_glyph_names", []) or [])
+            preview = ", ".join(names[:3])
+            if len(names) > 3:
+                preview += ", +%d" % (len(names) - 3)
+            self.w.snapshotStatus.set("Snapshot: %s" % (preview or "(saved)"))
+        else:
+            self.w.snapshotStatus.set("No snapshot saved.")
 
     @objc.python_method
     def _on_event(self, event):
@@ -416,6 +449,8 @@ class TypoChatPlugin(GeneralPlugin):
                 color=NSColor.systemRedColor(),
             )
 
+        if kind in ("tool_result", "done", "cancelled", "iteration_limit"):
+            self._refresh_snapshot_ui()
         self._scroll_to_end()
 
     @objc.python_method
@@ -483,6 +518,34 @@ class TypoChatPlugin(GeneralPlugin):
         self.w.cancelButton.enable(False)
 
     @objc.python_method
+    def _on_reset_snapshot_(self, sender):
+        # AppKit calls this on the main thread; do the work directly here.
+        # Do NOT route through ``_run_on_main_sync`` — that would self-wait on
+        # NSOperationQueue.mainQueue and deadlock the UI.
+        if self._worker_busy:
+            return
+        store = getattr(self._tool_ctx, "snapshot_store", None)
+        if store is None or not store.has_snapshot():
+            self._refresh_snapshot_ui()
+            return
+        font = self._font_provider()
+        if font is None:
+            _show_alert("Typo Chat", "No font is open — cannot reset snapshot.")
+            return
+        try:
+            info = store.reset(font)
+        except Exception as e:
+            _show_alert("Typo Chat", "Reset failed: %s" % e)
+            return
+        names = ", ".join(info.get("glyph_names", []) or [])
+        self._append_plain_text(
+            "\n[manual reset_snapshot] reverted: %s\n\n" % names,
+            color=NSColor.systemOrangeColor(),
+        )
+        self._refresh_snapshot_ui()
+        self._scroll_to_end()
+
+    @objc.python_method
     def _on_new_chat_(self, sender):
         if self._worker_busy and self._cancel_event is not None:
             self._cancel_event.set()
@@ -496,6 +559,10 @@ class TypoChatPlugin(GeneralPlugin):
         self.w.tokenUsageLabel.set(self._state.usage_caption())
         self.w.approveButton.enable(False)
         self.w.rejectButton.enable(False)
+        store = getattr(self._tool_ctx, "snapshot_store", None)
+        if store is not None:
+            store.clear()
+        self._refresh_snapshot_ui()
         self._save_settings_from_ui()
 
     @objc.python_method

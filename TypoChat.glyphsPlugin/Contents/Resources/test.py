@@ -353,12 +353,71 @@ def _test_agent_loop_fake():
     assert s.messages[-2]["role"] == "user"
 
 
+def _test_snapshot_store_pure():
+    import tools
+
+    font = _build_fake_font()
+    store = tools.SnapshotStore()
+    ctx = tools.ToolContext(font_provider=lambda: font, snapshot_store=store)
+
+    assert not store.has_snapshot()
+
+    out = tools.execute_tool("reset_snapshot", {}, ctx)
+    assert out.startswith("[error]"), out
+    out = tools.execute_tool("diff_pre_post", {"text": "Ђ"}, ctx)
+    assert out.startswith("[error]") and "snapshot" in out.lower(), out
+
+    out = tools.execute_tool("save_snapshot", {"glyph_names": []}, ctx)
+    assert out.startswith("[error]"), out
+    out = tools.execute_tool("save_snapshot", {"glyph_names": ["NoSuch"]}, ctx)
+    assert out.startswith("[error]") and "NoSuch" in out, out
+
+    out = tools.execute_tool("save_snapshot", {"glyph_names": ["Dje-cy"]}, ctx)
+    assert "Snapshot saved" in out, out
+    assert store.has_snapshot()
+    assert store._glyph_names == ["Dje-cy"]
+    assert set(store._slot["Dje-cy"].keys()) == {"M_REG", "M_BOLD"}
+    bold_pre = store._slot["Dje-cy"]["M_BOLD"]
+    assert bold_pre["width"] == 1200.0
+    ys_pre = sorted(int(n["y"]) for n in bold_pre["paths"][0]["nodes"])
+    assert ys_pre == [1230, 1230, 1420, 1420]
+
+    tools.execute_tool(
+        "move_nodes_where",
+        {
+            "glyph": "Dje-cy",
+            "master": "Bold",
+            "predicate": {"y": 1230},
+            "delta": {"dy": -72},
+        },
+        ctx,
+    )
+    layer = font.glyphs["Dje-cy"].layers["M_BOLD"]
+    ys_mid = sorted(int(n.position.y) for n in layer.paths[0].nodes)
+    assert ys_mid == [1158, 1158, 1420, 1420], ys_mid
+
+    out = tools.execute_tool("reset_snapshot", {}, ctx)
+    assert "Snapshot restored" in out, out
+    ys_post = sorted(int(n.position.y) for n in layer.paths[0].nodes)
+    assert ys_post == [1230, 1230, 1420, 1420], ys_post
+    assert store.has_snapshot(), "snapshot should persist after reset"
+
+    out = tools.execute_tool("save_snapshot", {"glyph_names": ["Dje-cy"]}, ctx)
+    assert "Overwrote previous snapshot" in out, out
+
+    store.clear()
+    assert not store.has_snapshot()
+    out = tools.execute_tool("reset_snapshot", {}, ctx)
+    assert out.startswith("[error]"), out
+
+
 def run_smoke():
     """Single entry point: run all smoke tests that do not require a live Glyphs font."""
     _test_utils_basics()
     _test_parse_assistant_response()
     _test_tool_handlers_pure()
     _test_agent_loop_fake()
+    _test_snapshot_store_pure()
     print("Typo Chat Resources/test.py: run_smoke() OK")
 
 
