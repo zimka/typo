@@ -1,4 +1,7 @@
 .venv/
 .cursor/
+.claude/
 third_party/
 *.pyc
+CLAUDE.md
+.DS_Store
