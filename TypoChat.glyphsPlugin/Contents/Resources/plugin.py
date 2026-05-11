@@ -1,5 +1,5 @@
 # encoding: utf-8
-"""Typo Chat — agentic Messages API (Claude-compatible) with tool use and human-in-the-loop."""
+"""Typo Chat — agentic Chat Completions API (OpenAI-compatible) with tool use and human-in-the-loop."""
 
 import threading
 
@@ -24,7 +24,7 @@ from state import ChatState, migration_default_strings
 
 _DEFAULTS_PREFIX = "com.typo."
 
-PLUGIN_VERSION = "0.3.2-phase2"
+PLUGIN_VERSION = "0.3.4"
 
 _TRANSCRIPT_IMAGE_MAX_W = 440
 _TRANSCRIPT_IMAGE_MAX_H = 140
@@ -136,7 +136,7 @@ class TypoChatPlugin(GeneralPlugin):
         self.w = Window((620, 880), self.name, minSize=(580, 760))
 
         y = 12
-        self.w.baseUrlLabel = TextBox((12, y, 300, 14), "Base URL (POST → …/v1/messages)")
+        self.w.baseUrlLabel = TextBox((12, y, 300, 14), "Base URL (POST → …/v1/chat/completions)")
         y += 18
         self.w.baseUrl = EditText(
             (12, y, -12, 22),
@@ -146,7 +146,7 @@ class TypoChatPlugin(GeneralPlugin):
         )
         y += 30
 
-        self.w.apiKeyLabel = TextBox((12, y, 300, 14), "OAuth / API key (Authorization: OAuth …)")
+        self.w.apiKeyLabel = TextBox((12, y, 300, 14), "API key (Authorization: Bearer …)")
         y += 18
         self.w.apiKey = EditText(
             (12, y, -12, 22),

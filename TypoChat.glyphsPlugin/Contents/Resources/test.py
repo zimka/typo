@@ -20,35 +20,22 @@ traceback is raised.
 
 def _test_utils_basics():
     from utils import (
-        _messages_endpoint,
-        build_messages_request_body,
+        _chat_endpoint,
         format_usage_caption,
         normalize_tool_result_content,
         normalize_usage,
-        parse_assistant_response,
     )
 
-    assert _messages_endpoint("") == ""
-    assert _messages_endpoint("   ") == ""
-    assert _messages_endpoint("https://api.example.com") == "https://api.example.com/v1/messages"
-    assert _messages_endpoint("https://api.example.com/") == "https://api.example.com/v1/messages"
-    assert _messages_endpoint(None) == ""
+    assert _chat_endpoint("") == ""
+    assert _chat_endpoint("   ") == ""
+    assert _chat_endpoint("https://api.example.com") == "https://api.example.com/v1/chat/completions"
+    assert _chat_endpoint("https://api.example.com/") == "https://api.example.com/v1/chat/completions"
+    assert _chat_endpoint(None) == ""
 
     z = normalize_usage(None)
     assert z["input_tokens"] == 0 and z["output_tokens"] == 0
     assert normalize_usage({"input_tokens": 100, "output_tokens": 50})["output_tokens"] == 50
     assert normalize_usage({"input_tokens": "12", "bad": "x"})["input_tokens"] == 12
-
-    body = build_messages_request_body(
-        "claude-sonnet-4-6",
-        1024,
-        [{"role": "user", "content": "hi"}],
-        "You are helpful.",
-        tools=[{"name": "t", "description": "", "input_schema": {"type": "object"}}],
-    )
-    assert body["model"] == "claude-sonnet-4-6"
-    assert body["tools"][0]["name"] == "t"
-    assert body["system"] == "You are helpful."
 
     cap = format_usage_caption(
         {"input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
@@ -65,49 +52,61 @@ def _test_utils_basics():
     assert blocks[0]["type"] == "text" and blocks[1]["type"] == "image"
 
 
-def _test_parse_assistant_response():
-    from utils import parse_assistant_response
+def _test_parse_provider_response():
+    from provider import parse_response
 
+    # Tool use turn (OpenAI format)
     tool_payload = {
-        "id": "msg_01",
-        "type": "message",
-        "role": "assistant",
-        "model": "claude-sonnet-4-6",
-        "content": [
-            {"type": "text", "text": "let me look"},
-            {
-                "type": "tool_use",
-                "id": "toolu_abc",
-                "name": "list_masters",
-                "input": {},
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "let me look",
+                "tool_calls": [
+                    {
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {
+                            "name": "list_masters",
+                            "arguments": "{}",
+                        }
+                    }
+                ],
             },
-        ],
-        "stop_reason": "tool_use",
-        "stop_sequence": None,
-        "usage": {"input_tokens": 42, "output_tokens": 11},
+            "finish_reason": "tool_calls",
+        }],
+        "usage": {"prompt_tokens": 42, "completion_tokens": 11, "total_tokens": 53},
     }
-    p = parse_assistant_response(tool_payload)
+    p = parse_response(tool_payload)
     assert p["error"] is None
     assert p["stop_reason"] == "tool_use"
     assert p["text"] == "let me look"
     assert len(p["tool_uses"]) == 1
     assert p["tool_uses"][0]["name"] == "list_masters"
-    assert p["tool_uses"][0]["id"] == "toolu_abc"
+    assert p["tool_uses"][0]["id"] == "call_abc"
     assert p["usage"]["input_tokens"] == 42
+    assert p["usage"]["output_tokens"] == 11
 
+    # End turn (OpenAI format)
     end_payload = {
-        "content": [{"type": "text", "text": "DOD PASSED"}],
-        "stop_reason": "end_turn",
-        "usage": {"input_tokens": 1, "output_tokens": 2},
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "DOD PASSED",
+                "tool_calls": None,
+            },
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
     }
-    p = parse_assistant_response(end_payload)
+    p = parse_response(end_payload)
     assert p["error"] is None
     assert p["text"] == "DOD PASSED"
     assert p["tool_uses"] == []
     assert p["stop_reason"] == "end_turn"
 
-    err_payload = {"type": "error", "error": {"type": "invalid_request_error", "message": "boom"}}
-    p = parse_assistant_response(err_payload)
+    # Error response
+    err_payload = {"error": {"type": "invalid_request_error", "message": "boom"}}
+    p = parse_response(err_payload)
     assert p["error"] and "boom" in p["error"]
 
 
@@ -288,30 +287,44 @@ def _test_tool_handlers_pure():
 def _test_agent_loop_fake():
     from state import ChatState
 
+    # OpenAI-format responses
     script = [
         {
-            "content": [
-                {"type": "text", "text": "Looking at masters."},
-                {
-                    "type": "tool_use",
-                    "id": "toolu_1",
-                    "name": "list_masters",
-                    "input": {},
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Looking at masters.",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "list_masters",
+                                "arguments": "{}",
+                            }
+                        }
+                    ],
                 },
-            ],
-            "stop_reason": "tool_use",
-            "usage": {"input_tokens": 1, "output_tokens": 2},
+                "finish_reason": "tool_calls",
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
         },
         {
-            "content": [{"type": "text", "text": "DOD PASSED"}],
-            "stop_reason": "end_turn",
-            "usage": {"input_tokens": 3, "output_tokens": 4},
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "DOD PASSED",
+                    "tool_calls": None,
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
         },
     ]
 
-    import state as state_mod
+    import provider as provider_mod
 
-    original_post = state_mod.post_messages_request
+    original_post = provider_mod.post_request
     calls = {"n": 0}
 
     def fake_post(body, url, auth_value):
@@ -319,7 +332,7 @@ def _test_agent_loop_fake():
         calls["n"] += 1
         return script[i]
 
-    state_mod.post_messages_request = fake_post
+    provider_mod.post_request = fake_post
     try:
         s = ChatState()
         s.update_settings_from_ui_fields(
@@ -342,7 +355,7 @@ def _test_agent_loop_fake():
             on_event=events.append,
         )
     finally:
-        state_mod.post_messages_request = original_post
+        provider_mod.post_request = original_post
 
     kinds = [e.get("kind") for e in events]
     assert kinds[0] == "user"
@@ -414,7 +427,7 @@ def _test_snapshot_store_pure():
 def run_smoke():
     """Single entry point: run all smoke tests that do not require a live Glyphs font."""
     _test_utils_basics()
-    _test_parse_assistant_response()
+    _test_parse_provider_response()
     _test_tool_handlers_pure()
     _test_agent_loop_fake()
     _test_snapshot_store_pure()

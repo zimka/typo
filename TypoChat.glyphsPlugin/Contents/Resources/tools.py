@@ -841,21 +841,17 @@ def _render_layer_run(font, master, text, contract):
     return _encode_png(rep)
 
 
-def _render_overlay_run(font, master, text, contract, store):
-    """Render the R/G overlay into one bitmap:
-    - Black background
-    - Pre (snapshot) pass: red ink, normal compositing (applied by temporarily swapping
-      snapshot into the live font and restoring afterwards).
-    - Post (live) pass: green ink, additive compositing (NSCompositingOperationPlusLighter),
-      so overlap of red+green becomes yellow.
-    Returns PNG bytes."""
-    from AppKit import NSBezierPath, NSColor, NSGraphicsContext
-
-    NS_COMPOSITING_PLUS_LIGHTER = 17  # NSCompositingOperationPlusLighter
+def _render_white_on_black_rep(font, master, text, contract):
+    """Rasterize glyph fills as white on an opaque black background (single mask pass)."""
+    from AppKit import (
+        NSBezierPath,
+        NSColor,
+        NSCompositingOperationSourceOver,
+        NSGraphicsContext,
+    )
 
     canvas_w = int(contract.get("canvas_w", 900))
     canvas_h = int(contract.get("canvas_h", 260))
-
     rep = _make_bitmap_rep(canvas_w, canvas_h)
     gc = NSGraphicsContext.graphicsContextWithBitmapImageRep_(rep)
     NSGraphicsContext.saveGraphicsState()
@@ -863,25 +859,108 @@ def _render_overlay_run(font, master, text, contract, store):
     try:
         NSColor.blackColor().set()
         NSBezierPath.bezierPathWithRect_(((0, 0), (canvas_w, canvas_h))).fill()
-
-        # Pass 1 — pre (snapshot) in red. Temporarily apply snapshot to live font.
-        current_snap = _snapshot_glyphs(font, store._glyph_names)
-        _apply_snapshot(font, store._slot)
-        try:
-            NSColor.redColor().set()
-            NSGraphicsContext.currentContext().setCompositingOperation_(2)  # NSCompositingOperationSourceOver
-            _draw_glyphs_run(font, master, text, contract)
-        finally:
-            _apply_snapshot(font, current_snap)
-
-        # Pass 2 — post (live) in green, additive.
-        NSGraphicsContext.currentContext().setCompositingOperation_(NS_COMPOSITING_PLUS_LIGHTER)
-        NSColor.greenColor().set()
+        NSGraphicsContext.currentContext().setCompositingOperation_(
+            NSCompositingOperationSourceOver
+        )
+        NSColor.whiteColor().set()
         _draw_glyphs_run(font, master, text, contract)
     finally:
         NSGraphicsContext.restoreGraphicsState()
+    return rep
 
-    return _encode_png(rep)
+
+def _bitmap_rep_row_bytes(rep):
+    """Copy packed row bytes from a non-planar 32-bpp ``NSBitmapImageRep`` (includes row padding)."""
+    bpr = int(rep.bytesPerRow())
+    h = int(rep.pixelsHigh())
+    n = bpr * h
+    ptr = rep.bitmapData()
+    if ptr is None:
+        raise RuntimeError("NSBitmapImageRep.bitmapData() is None")
+    try:
+        return bytearray(memoryview(ptr).tobytes()[:n])
+    except TypeError:
+        from ctypes import string_at
+
+        addr = int(ptr)
+        return bytearray(string_at(addr, n))
+
+
+def _merge_silhouettes_to_overlay_rg(pre_buf, post_buf, out_buf, bpr, h, w):
+    """Combine two white-on-black masks into red/green overlay (yellow = overlap).
+
+    Avoids ``NSCompositingOperationPlusLighter`` on bitmap contexts, which can drop
+    interior pixels (premultiplied alpha / compositing quirks) so only edge fringes
+    remain visible.
+    """
+    for y in range(h):
+        row = y * bpr
+        for x in range(w):
+            i = row + x * 4
+            lp = (pre_buf[i] + pre_buf[i + 1] + pre_buf[i + 2]) / (3.0 * 255.0)
+            lq = (post_buf[i] + post_buf[i + 1] + post_buf[i + 2]) / (3.0 * 255.0)
+            lp = max(0.0, min(1.0, lp))
+            lq = max(0.0, min(1.0, lq))
+            out_buf[i] = int(round(lp * 255.0))
+            out_buf[i + 1] = int(round(lq * 255.0))
+            out_buf[i + 2] = 0
+            out_buf[i + 3] = 255
+
+
+def _bitmap_rep_write_row_bytes(rep, buf):
+    bpr = int(rep.bytesPerRow())
+    h = int(rep.pixelsHigh())
+    n = bpr * h
+    if len(buf) != n:
+        raise RuntimeError("buffer length does not match bitmap")
+    ptr = rep.bitmapData()
+    if ptr is None:
+        raise RuntimeError("NSBitmapImageRep.bitmapData() is None")
+    try:
+        memoryview(ptr).cast("B")[:n] = buf
+    except TypeError:
+        from ctypes import addressof, c_char, memmove
+
+        raw = (c_char * n).from_buffer(buf)
+        memmove(int(ptr), addressof(raw), n)
+
+
+def _render_overlay_run(font, master, text, contract, store):
+    """Render the R/G overlay: red = pre (snapshot), green = post (live), yellow = overlap.
+
+    Implementation: draw snapshot and live glyphs as white-on-black masks, then merge
+    pixels so channels are independent (no additive compositing in the graphics state).
+    Returns PNG bytes."""
+    canvas_w = int(contract.get("canvas_w", 900))
+    canvas_h = int(contract.get("canvas_h", 260))
+
+    current_snap = _snapshot_glyphs(font, store._glyph_names)
+    _apply_snapshot(font, store._slot)
+    try:
+        pre_rep = _render_white_on_black_rep(font, master, text, contract)
+    finally:
+        _apply_snapshot(font, current_snap)
+
+    post_rep = _render_white_on_black_rep(font, master, text, contract)
+
+    bpr = int(pre_rep.bytesPerRow())
+    h = int(pre_rep.pixelsHigh())
+    w = int(pre_rep.pixelsWide())
+    if (
+        bpr != int(post_rep.bytesPerRow())
+        or h != int(post_rep.pixelsHigh())
+        or w != int(post_rep.pixelsWide())
+    ):
+        raise RuntimeError("overlay silhouette bitmaps differ in layout")
+
+    pre_buf = _bitmap_rep_row_bytes(pre_rep)
+    post_buf = _bitmap_rep_row_bytes(post_rep)
+    out_buf = bytearray(bpr * h)
+    _merge_silhouettes_to_overlay_rg(pre_buf, post_buf, out_buf, bpr, h, w)
+
+    out_rep = _make_bitmap_rep(canvas_w, canvas_h)
+    _bitmap_rep_write_row_bytes(out_rep, out_buf)
+    return _encode_png(out_rep)
 
 
 def _lookup_char(font, ch):

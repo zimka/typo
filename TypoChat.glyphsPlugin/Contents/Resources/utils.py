@@ -5,10 +5,8 @@ import json
 import ssl
 import urllib.request
 
-DEFAULT_MODEL = "claude-sonnet-4-6"
+DEFAULT_MODEL = "gpt-4o"
 DEFAULT_MAX_TOKENS = "2048"
-
-ANTHROPIC_VERSION = "2023-06-01"
 
 MARKER_ISSUE_RECOGNIZED = "ISSUE RECOGNIZED"
 MARKER_ISSUE_NOT_RECOGNIZED = "ISSUE NOT RECOGNIZED"
@@ -95,11 +93,11 @@ _USAGE_KEYS = (
 )
 
 
-def _messages_endpoint(base_url):
+def _chat_endpoint(base_url):
     base = (base_url or "").strip().rstrip("/")
     if not base:
         return ""
-    return base + "/v1/messages"
+    return base + "/v1/chat/completions"
 
 
 def ssl_context():
@@ -165,94 +163,6 @@ def format_usage_caption(last_usage, session_totals):
     return "Tokens — %s · %s" % (last_part, session_part)
 
 
-def build_messages_request_body(model, max_tokens, messages, system_text, tools=None):
-    """
-    Build an Anthropic Messages API request body.
-
-    ``messages`` items may carry string content or a list of content blocks
-    (for tool_use / tool_result turns) — the API accepts both and we pass through.
-    """
-    body = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": list(messages),
-    }
-    if system_text:
-        body["system"] = system_text
-    if tools:
-        body["tools"] = list(tools)
-    return body
-
-
-def parse_assistant_response(payload):
-    """
-    Parse a successful Anthropic Messages response.
-
-    Returns a dict with:
-      - ``content_blocks``: raw ``content`` list from the payload (list of block dicts).
-      - ``text``: concatenated text from all ``text`` blocks.
-      - ``tool_uses``: list of ``{"id", "name", "input"}`` for each ``tool_use`` block.
-      - ``stop_reason``: string from payload (``end_turn``, ``tool_use``, ``max_tokens``, ...).
-      - ``usage``: normalized usage dict.
-      - ``error``: None on success, else a user-facing error string (and other fields are empty).
-    """
-    out = {
-        "content_blocks": [],
-        "text": "",
-        "tool_uses": [],
-        "stop_reason": None,
-        "usage": normalize_usage(None),
-        "error": None,
-    }
-    if not isinstance(payload, dict):
-        out["error"] = "[error] unexpected response: %s" % str(payload)[:400]
-        return out
-
-    if payload.get("type") == "error":
-        inner = payload.get("error")
-        if isinstance(inner, dict):
-            msg = inner.get("message") or inner.get("type") or json.dumps(inner)
-        else:
-            msg = str(inner)
-        out["error"] = "[error] %s" % msg
-        return out
-
-    err = payload.get("error")
-    if isinstance(err, dict):
-        msg = err.get("message") or err.get("type") or json.dumps(err)
-        out["error"] = "[error] %s" % msg
-        return out
-    if isinstance(err, str) and err:
-        out["error"] = "[error] %s" % err
-        return out
-
-    blocks = payload.get("content") or []
-    if not isinstance(blocks, list):
-        out["error"] = "[error] response has no content list"
-        return out
-    out["content_blocks"] = blocks
-
-    text_parts = []
-    tool_uses = []
-    for b in blocks:
-        if not isinstance(b, dict):
-            continue
-        t = b.get("type")
-        if t == "text":
-            text_parts.append(b.get("text") or "")
-        elif t == "tool_use":
-            tool_uses.append(
-                {
-                    "id": b.get("id") or "",
-                    "name": b.get("name") or "",
-                    "input": b.get("input") if isinstance(b.get("input"), dict) else {},
-                }
-            )
-    out["text"] = "\n".join(p for p in text_parts if p).strip()
-    out["tool_uses"] = tool_uses
-    out["stop_reason"] = payload.get("stop_reason")
-    out["usage"] = normalize_usage(payload.get("usage"))
-    return out
 
 
 def normalize_tool_result_content(raw):
@@ -290,12 +200,3 @@ def normalize_tool_result_content(raw):
     return [_block_for_item(raw)]
 
 
-def post_messages_request(body, url, auth_value):
-    data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("anthropic-version", ANTHROPIC_VERSION)
-    req.add_header("Authorization", "OAuth %s" % auth_value.strip())
-    with urllib.request.urlopen(req, timeout=600, context=ssl_context()) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
-        return json.loads(raw) if raw else {}

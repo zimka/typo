@@ -10,14 +10,16 @@ from utils import (
     DEFAULT_SYSTEM_PROMPT,
     MARKER_PLAN_APPROVAL,
     MAX_AGENT_ITERATIONS,
-    _messages_endpoint,
-    build_messages_request_body,
+    _chat_endpoint,
     format_usage_caption,
     normalize_tool_result_content,
     normalize_usage,
-    parse_assistant_response,
     parse_max_tokens,
-    post_messages_request,
+)
+from provider import (
+    build_request_body,
+    post_request,
+    parse_response,
 )
 
 _SETTINGS_KEYS = frozenset(
@@ -87,11 +89,11 @@ class ChatState:
 
     def validate_setting_errors(self):
         base = (self.settings.get("baseUrl") or "").strip()
-        if not _messages_endpoint(base):
+        if not _chat_endpoint(base):
             return "Set Base URL first."
         auth = (self.settings.get("apiKey") or "").strip()
         if not auth:
-            return "Set OAuth / API key first."
+            return "Set API key first."
         return ""
 
     def run_agent_turn(
@@ -133,7 +135,7 @@ class ChatState:
         max_tokens = parse_max_tokens(s.get("maxTokens") or "")
         system_text = (s.get("systemPrompt") or "").strip()
         base = (s.get("baseUrl") or "").strip()
-        url = _messages_endpoint(base)
+        url = _chat_endpoint(base)
         auth = s.get("apiKey") or ""
 
         iteration = 0
@@ -143,10 +145,10 @@ class ChatState:
                 return
 
             try:
-                body = build_messages_request_body(
+                body = build_request_body(
                     model, max_tokens, self._messages, system_text, tools=tool_schemas
                 )
-                payload = post_messages_request(body, url, auth)
+                payload = post_request(body, url, auth)
             except urllib.error.HTTPError as e:
                 try:
                     err_body = e.read().decode("utf-8", errors="replace")
@@ -158,7 +160,7 @@ class ChatState:
                 on_event({"kind": "error", "text": str(e)})
                 return
 
-            parsed = parse_assistant_response(payload)
+            parsed = parse_response(payload)
             if parsed["error"]:
                 on_event({"kind": "error", "text": parsed["error"]})
                 return
@@ -213,7 +215,7 @@ class ChatState:
                 content_blocks = normalize_tool_result_content(raw_result)
                 block = {
                     "type": "tool_result",
-                    "tool_use_id": tu["id"],
+                    "tool_call_id": tu["id"],
                     "content": content_blocks,
                 }
                 if is_error:
