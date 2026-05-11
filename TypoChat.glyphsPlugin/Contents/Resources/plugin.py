@@ -6,25 +6,28 @@ import threading
 import objc
 from AppKit import (
     NSAlert,
+    NSApp,
     NSAttributedString,
     NSBlockOperation,
     NSColor,
+    NSEventModifierFlagShift,
     NSFont,
     NSImage,
     NSMenuItem,
     NSTextAttachment,
 )
-from Foundation import NSData, NSOperationQueue, NSSize
+from Foundation import NSData, NSOperationQueue, NSSelectorFromString, NSSize
 from GlyphsApp import Glyphs, WINDOW_MENU
 from GlyphsApp.plugins import GeneralPlugin
-from vanilla import Button, EditText, TextBox, TextEditor, Window
+from vanilla import Button, EditText, PopUpButton, TextBox, TextEditor, Window
 
 import tools
+from _version import __version__ as PLUGIN_VERSION
 from state import ChatState, migration_default_strings
 
 _DEFAULTS_PREFIX = "com.typo."
 
-PLUGIN_VERSION = "0.3.4"
+_INSERT_NEWLINE_SEL = NSSelectorFromString("insertNewline:")
 
 _TRANSCRIPT_IMAGE_MAX_W = 440
 _TRANSCRIPT_IMAGE_MAX_H = 140
@@ -133,7 +136,7 @@ class TypoChatPlugin(GeneralPlugin):
     def _build_window(self):
         self._frame_autosave_set = False
         s = self._state.settings
-        self.w = Window((620, 880), self.name, minSize=(580, 760))
+        self.w = Window((620, 900), self.name, minSize=(580, 800))
 
         y = 12
         self.w.baseUrlLabel = TextBox((12, y, 300, 14), "Base URL (POST → …/v1/chat/completions)")
@@ -186,58 +189,57 @@ class TypoChatPlugin(GeneralPlugin):
         self.w.transcriptLabel = TextBox((12, y, 200, 14), "Transcript")
         y += 18
         self.w.transcript = TextEditor(
-            (12, y, -12, 260),
+            (12, y, -12, 228),
             text="",
             readOnly=True,
             checksSpelling=False,
         )
-        y += 268
+        y += 248
 
         self.w.inputLabel = TextBox((12, y, 200, 14), "Message")
         y += 18
-        self.w.inputField = EditText(
-            (12, y, -12, 22),
-            "",
-            placeholder="Type a message…",
-            continuous=False,
+        self.w.inputField = TextEditor(
+            (12, y, -12, 72),
+            text="",
+            readOnly=False,
+            checksSpelling=True,
         )
-        y += 26
+        y += 80
+        self.w.inputHint = TextBox(
+            (12, y, -12, 28),
+            "Return: send. Shift+Return: new line. ⌘Return: send. Type Approve (alone) to authorize a pending plan.",
+            sizeStyle="small",
+        )
+        y += 32
         self.w.tokenUsageLabel = TextBox((12, y, -12, 28), self._state.usage_caption())
         y += 32
 
         self.w.sendButton = Button(
-            (12, y, 100, 22),
+            (12, y, 88, 22),
             "Send",
             callback=self._on_send_,
         )
-        self.w.approveButton = Button(
-            (120, y, 90, 22),
-            "Approve",
-            callback=self._on_approve_,
-        )
-        self.w.approveButton.enable(False)
-        self.w.rejectButton = Button(
-            (218, y, 90, 22),
-            "Reject",
-            callback=self._on_reject_,
-        )
-        self.w.rejectButton.enable(False)
+        self.w.sendButton.bind("\r", ["command"])
         self.w.cancelButton = Button(
-            (316, y, 90, 22),
+            (108, y, 72, 22),
             "Cancel",
             callback=self._on_cancel_,
         )
         self.w.cancelButton.enable(False)
-        self.w.newChatButton = Button(
-            (-112, y, 100, 22),
-            "New chat",
-            callback=self._on_new_chat_,
+        self.w.cancelButton.show(False)
+        self.w.moreMenu = PopUpButton(
+            (-108, y, 96, 18),
+            ["More", "New chat", "Reset snapshot"],
+            callback=self._on_more_menu_,
+            sizeStyle="small",
         )
+        self.w.moreMenu.set(0)
         y += 28
         self.w.resetSnapshotButton = Button(
             (12, y, 160, 22),
             "Reset snapshot",
             callback=self._on_reset_snapshot_,
+            sizeStyle="small",
         )
         self.w.resetSnapshotButton.enable(False)
         self.w.snapshotStatus = TextBox(
@@ -252,6 +254,10 @@ class TypoChatPlugin(GeneralPlugin):
             sizeStyle="small",
             alignment="right",
         )
+
+        _in_tv = self.w.inputField.getNSTextView()
+        if _in_tv is not None:
+            _in_tv.setDelegate_(self)
 
     @objc.python_method
     def settings(self):
@@ -306,12 +312,45 @@ class TypoChatPlugin(GeneralPlugin):
         )
         _set_default("settingsJson", self._state.get_settings_json())
 
+    def textView_doCommandBySelector_(self, textView, commandSelector):
+        if commandSelector != _INSERT_NEWLINE_SEL:
+            return False
+        try:
+            in_tv = self.w.inputField.getNSTextView()
+        except Exception:
+            in_tv = None
+        if in_tv is None or textView != in_tv:
+            return False
+        return self._handle_input_insert_newline()
+
     @objc.python_method
     def _transcript_text_view(self):
         try:
             return self.w.transcript.getNSTextView()
         except Exception:
             return None
+
+    @objc.python_method
+    def _handle_input_insert_newline(self):
+        """Delegate helper: True if Return was handled (no newline inserted)."""
+        if self._worker_busy:
+            return False
+        evt = NSApp.currentEvent()
+        if evt is not None and evt.modifierFlags() & NSEventModifierFlagShift:
+            return False
+        if not (self.w.inputField.get() or "").strip():
+            return False
+        self._on_send_(None)
+        return True
+
+    @objc.python_method
+    def _on_more_menu_(self, sender):
+        idx = sender.get()
+        if idx == 1:
+            self._on_new_chat_(sender)
+        elif idx == 2:
+            self._on_reset_snapshot_(sender)
+        sender.set(0)
 
     @objc.python_method
     def _append_plain_text(self, text, color=None):
@@ -361,10 +400,12 @@ class TypoChatPlugin(GeneralPlugin):
     def _set_busy(self, busy):
         self._worker_busy = busy
         self.w.sendButton.enable(not busy)
+        try:
+            self.w.inputField.enable(not busy)
+        except Exception:
+            pass
         self.w.cancelButton.enable(busy)
-        if busy:
-            self.w.approveButton.enable(False)
-            self.w.rejectButton.enable(False)
+        self.w.cancelButton.show(busy)
         self._refresh_snapshot_ui()
 
     @objc.python_method
@@ -426,11 +467,9 @@ class TypoChatPlugin(GeneralPlugin):
                             self._append_image(raw)
         elif kind == "approval_required":
             self._append_plain_text(
-                "\n[waiting for Approve / Reject]\n",
+                "\n[Plan pending — type Approve alone in the message field to authorize, or send prose to refine the plan.]\n",
                 color=NSColor.systemOrangeColor(),
             )
-            self.w.approveButton.enable(True)
-            self.w.rejectButton.enable(True)
         elif kind == "usage_updated":
             self.w.tokenUsageLabel.set(self._state.usage_caption())
         elif kind == "done":
@@ -500,18 +539,6 @@ class TypoChatPlugin(GeneralPlugin):
         self._start_turn(text)
 
     @objc.python_method
-    def _on_approve_(self, sender):
-        self.w.approveButton.enable(False)
-        self.w.rejectButton.enable(False)
-        self._start_turn("approve")
-
-    @objc.python_method
-    def _on_reject_(self, sender):
-        self.w.approveButton.enable(False)
-        self.w.rejectButton.enable(False)
-        self._start_turn("reject — please revise the plan and propose another approach")
-
-    @objc.python_method
     def _on_cancel_(self, sender):
         if self._cancel_event is not None:
             self._cancel_event.set()
@@ -557,8 +584,6 @@ class TypoChatPlugin(GeneralPlugin):
         self.w.systemPrompt.set(self._state.settings["systemPrompt"])
         self.w.inputField.set("")
         self.w.tokenUsageLabel.set(self._state.usage_caption())
-        self.w.approveButton.enable(False)
-        self.w.rejectButton.enable(False)
         store = getattr(self._tool_ctx, "snapshot_store", None)
         if store is not None:
             store.clear()

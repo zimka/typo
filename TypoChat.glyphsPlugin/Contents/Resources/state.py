@@ -18,8 +18,8 @@ from utils import (
 )
 from provider import (
     build_request_body,
-    post_request,
     parse_response,
+    post_request,
 )
 
 _SETTINGS_KEYS = frozenset(
@@ -195,10 +195,11 @@ class ChatState:
 
             stop_reason = parsed["stop_reason"]
             if not tool_uses or stop_reason != "tool_use":
-                if MARKER_PLAN_APPROVAL in (parsed["text"] or ""):
-                    on_event({"kind": "approval_required", "text": parsed["text"]})
+                _txt = parsed["text"] or ""
+                if MARKER_PLAN_APPROVAL in _txt:
+                    on_event({"kind": "approval_required", "text": _txt})
                 else:
-                    on_event({"kind": "done", "text": parsed["text"], "stop_reason": stop_reason})
+                    on_event({"kind": "done", "text": _txt, "stop_reason": stop_reason})
                 return
 
             tool_result_blocks = []

@@ -4,5 +4,4 @@ requires-python = ">=3.11"
 
 [[package]]
 name = "typo-plugin"
-version = "0.3.4"
-source = { virtual = "." }
+source = { editable = "." }
