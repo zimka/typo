@@ -5,6 +5,7 @@ import json
 import urllib.error
 
 from utils import (
+    DEFAULT_BASE_URL,
     DEFAULT_MAX_TOKENS,
     DEFAULT_MODEL,
     DEFAULT_SYSTEM_PROMPT,
@@ -57,7 +58,7 @@ class ChatState:
         self._last_usage = None
         self._usage_session = {k: 0 for k in _USAGE_SUM_KEYS}
         self.settings = {
-            "baseUrl": "",
+            "baseUrl": DEFAULT_BASE_URL,
             "apiKey": "",
             "model": DEFAULT_MODEL,
             "maxTokens": DEFAULT_MAX_TOKENS,
@@ -291,6 +292,8 @@ class ChatState:
 
     def _normalize_settings(self):
         s = self.settings
+        bu = (s.get("baseUrl") or "").strip()
+        s["baseUrl"] = bu if bu else DEFAULT_BASE_URL
         s["model"] = (s.get("model") or "").strip() or DEFAULT_MODEL
         s["maxTokens"] = (s.get("maxTokens") or "").strip() or DEFAULT_MAX_TOKENS
         s["systemPrompt"] = s.get("systemPrompt") or ""

@@ -5,7 +5,8 @@ import json
 import ssl
 import urllib.request
 
-DEFAULT_MODEL = "gpt-4o"
+DEFAULT_BASE_URL = "https://api.openai.com"
+DEFAULT_MODEL = "gpt-5.4"
 DEFAULT_MAX_TOKENS = "2048"
 
 MARKER_ISSUE_RECOGNIZED = "ISSUE RECOGNIZED"

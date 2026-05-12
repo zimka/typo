@@ -24,6 +24,7 @@ from vanilla import Button, EditText, PopUpButton, TextBox, TextEditor, Window
 import tools
 from _version import __version__ as PLUGIN_VERSION
 from state import ChatState, migration_default_strings
+from utils import DEFAULT_BASE_URL
 
 _DEFAULTS_PREFIX = "com.typo."
 
@@ -76,7 +77,7 @@ def _load_persistent_settings(state):
     else:
         dm, dmt, _dsp = migration_default_strings()
         state.migrate_from_legacy_flat(
-            baseUrl=_get_default("baseUrl", ""),
+            baseUrl=_get_default("baseUrl", DEFAULT_BASE_URL),
             apiKey=_get_default("apiKey", ""),
             model=_get_default("model", dm),
             maxTokens=_get_default("maxTokens", dmt),
@@ -144,7 +145,7 @@ class TypoChatPlugin(GeneralPlugin):
         self.w.baseUrl = EditText(
             (12, y, -12, 22),
             s["baseUrl"],
-            placeholder="https://your-provider.example.com",
+            placeholder=DEFAULT_BASE_URL,
             continuous=False,
         )
         y += 30
