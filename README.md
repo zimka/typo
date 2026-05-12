@@ -48,6 +48,8 @@ If something fails after a change, restore **Base URL** `https://api.openai.com`
 
 ## The TypoChat window
 
+<img src="assets/screen_typochat.png" alt="Typo Chat plugin window in Glyphs: Base URL, API key, model, system prompt, transcript, and message field." style="width: 66.67%; max-width: 100%; height: auto;" />
+
 One window combines settings and chat:
 
 | Area | Purpose |
