@@ -17,11 +17,7 @@ from utils import (
     normalize_usage,
     parse_max_tokens,
 )
-from provider import (
-    build_request_body,
-    parse_response,
-    post_request,
-)
+import provider
 
 _SETTINGS_KEYS = frozenset(
     {"baseUrl", "apiKey", "model", "maxTokens", "systemPrompt"}
@@ -146,10 +142,10 @@ class ChatState:
                 return
 
             try:
-                body = build_request_body(
+                body = provider.build_request_body(
                     model, max_tokens, self._messages, system_text, tools=tool_schemas
                 )
-                payload = post_request(body, url, auth)
+                payload = provider.post_request(body, url, auth)
             except urllib.error.HTTPError as e:
                 try:
                     err_body = e.read().decode("utf-8", errors="replace")
@@ -161,7 +157,7 @@ class ChatState:
                 on_event({"kind": "error", "text": str(e)})
                 return
 
-            parsed = parse_response(payload)
+            parsed = provider.parse_response(payload)
             if parsed["error"]:
                 on_event({"kind": "error", "text": parsed["error"]})
                 return
